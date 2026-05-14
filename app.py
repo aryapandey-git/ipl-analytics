@@ -6,6 +6,11 @@ import requests
 import os
 
 from data_loader import load_raw_data, clean_data
+from ml_models import (
+    build_win_probability_model, predict_win_probability,
+    build_score_predictor, predict_final_score,
+    select_best_xi,
+)
 from analytics import (
     top_run_scorers, top_wicket_takers,
     top_six_hitters, most_economical_bowlers,
@@ -439,6 +444,17 @@ def load_data():
 with st.spinner("Loading IPL data..."):
     matches, deliveries = load_data()
 
+@st.cache_resource
+def train_models(matches, deliveries):
+    with st.spinner("Training ML models..."):
+        win_model, win_scaler, win_enc, win_feats, win_metrics = build_win_probability_model(matches, deliveries)
+        score_model, score_scaler, score_enc, score_feats, score_metrics = build_score_predictor(matches, deliveries)
+    return (win_model, win_scaler, win_enc, win_feats, win_metrics,
+            score_model, score_scaler, score_enc, score_feats, score_metrics)
+
+(win_model, win_scaler, win_enc, win_feats, win_metrics,
+ score_model, score_scaler, score_enc, score_feats, score_metrics) = train_models(matches, deliveries)
+
 
 
 # ══════════════════════════════════════════════
@@ -481,8 +497,8 @@ st.divider()
 #  TABS
 # ══════════════════════════════════════════════
 
-tab_overview, tab_batters, tab_bowlers, tab_compare, tab_h2h, tab_teams = st.tabs([
-    "Overview", "Batters", "Bowlers", "Compare", "Head-to-Head", "Teams",
+tab_overview, tab_batters, tab_bowlers, tab_compare, tab_h2h, tab_teams, tab_ml = st.tabs([
+    "Overview", "Batters", "Bowlers", "Compare", "Head-to-Head", "Teams", "Predictions",
 ])
 
 
@@ -1006,6 +1022,253 @@ with tab_teams:
         apply_theme(fig_win, height=300)
         st.plotly_chart(fig_win, use_container_width=True)
         st.dataframe(win_trend.set_index('Season'), use_container_width=True)
+
+
+# ══════════════════════════════════════════════
+#  TAB 7 — PREDICTIONS (ML)
+# ══════════════════════════════════════════════
+
+with tab_ml:
+    st.markdown('<h1 style="font-family: Playfair Display, serif; font-weight: 400; font-size: 2.0rem; color: #4A2E12;">Predictions & ML Models</h1>', unsafe_allow_html=True)
+    st.caption("Machine learning models trained on IPL 2008–2024 data")
+    st.divider()
+
+    ml_tab1, ml_tab2, ml_tab3 = st.tabs(["Win Probability", "Score Predictor", "Best XI"])
+
+    # ── All teams and venues for dropdowns ──
+    all_teams  = sorted(pd.concat([matches['team1'], matches['team2']]).dropna().unique())
+    all_venues = sorted(matches['venue'].dropna().unique()) if 'venue' in matches.columns else []
+
+    # ────────────────────────────────────────
+    #  ML SUB-TAB 1 — WIN PROBABILITY
+    # ────────────────────────────────────────
+    with ml_tab1:
+        st.markdown('<div class="section-title">Win Probability Predictor</div>', unsafe_allow_html=True)
+        st.caption(f"Logistic Regression · Trained on {win_metrics.get('train_size', 0):,} innings · Accuracy: {win_metrics.get('accuracy', 0)}%")
+
+        st.subheader("Match Situation")
+        wp_c1, wp_c2 = st.columns(2)
+        with wp_c1:
+            wp_team  = st.selectbox("Batting Team", all_teams, key="wp_team")
+            wp_venue = st.selectbox("Venue", all_venues, key="wp_venue") if all_venues else "Unknown"
+            wp_pp_runs = st.slider("Powerplay Runs (Overs 1–6)", 0, 90, 45, key="wp_pp")
+        with wp_c2:
+            wp_pp_wkts  = st.slider("Powerplay Wickets Lost", 0, 4, 1, key="wp_wkts")
+            wp_crr      = st.slider("Current Run Rate", 0.0, 16.0, 8.0, 0.1, key="wp_crr")
+            wp_tot_wkts = st.slider("Total Wickets Lost (so far)", 0, 10, 2, key="wp_totwkts")
+
+        if st.button("Predict Win Probability", key="wp_btn"):
+            prob = predict_win_probability(
+                win_model, win_scaler, win_enc, win_feats,
+                wp_team, wp_venue, wp_pp_runs, wp_pp_wkts, wp_crr, wp_tot_wkts
+            )
+            lose_prob = round(100 - prob, 1)
+
+            r1, r2 = st.columns(2)
+            r1.metric(f"{wp_team} Win %", f"{prob}%")
+            r2.metric("Opposition Win %", f"{lose_prob}%")
+
+            # Gauge chart
+            fig_wp = go.Figure(go.Indicator(
+                mode="gauge+number",
+                value=prob,
+                title={"text": f"{wp_team} Win Probability",
+                       "font": {"family": "Playfair Display", "color": "#4A2E12", "size": 15}},
+                number={"suffix": "%", "font": {"family": "Playfair Display", "color": "#4A2E12", "size": 42}},
+                gauge={
+                    "axis":  {"range": [0, 100], "tickcolor": "#8C6845",
+                              "tickfont": {"color": "#8C6845", "family": "Poppins"}},
+                    "bar":   {"color": "#9B6440"},
+                    "bgcolor": "#F3EDE4",
+                    "bordercolor": "#DDD0BC",
+                    "steps": [
+                        {"range": [0,  33], "color": "#FAF8F4"},
+                        {"range": [33, 66], "color": "#E8DDD0"},
+                        {"range": [66,100], "color": "#DDD0BC"},
+                    ],
+                    "threshold": {
+                        "line": {"color": "#6B3F20", "width": 3},
+                        "thickness": 0.75,
+                        "value": 50,
+                    }
+                }
+            ))
+            fig_wp.update_layout(height=300, margin=dict(l=30, r=30, t=40, b=10),
+                                 paper_bgcolor="rgba(0,0,0,0)")
+            st.plotly_chart(fig_wp, use_container_width=True)
+
+            if prob >= 65:
+                verdict = f"Strong position — {wp_team} are favourites with {prob}% win probability."
+            elif prob >= 50:
+                verdict = f"Slight edge — {wp_team} are marginally ahead at {prob}%."
+            elif prob >= 35:
+                verdict = f"Under pressure — {wp_team} need to lift the run rate. Win probability: {prob}%."
+            else:
+                verdict = f"Tough situation — {wp_team} are in trouble at only {prob}% win probability."
+
+            st.markdown(f'<div class="insight-box">{verdict}</div>', unsafe_allow_html=True)
+
+        st.divider()
+        st.caption(f"Model: Logistic Regression · Test accuracy: {win_metrics.get('accuracy', 0)}% · Training samples: {win_metrics.get('train_size', 0):,}")
+
+    # ────────────────────────────────────────
+    #  ML SUB-TAB 2 — SCORE PREDICTOR
+    # ────────────────────────────────────────
+    with ml_tab2:
+        st.markdown('<div class="section-title">Match Score Predictor</div>', unsafe_allow_html=True)
+        st.caption(f"Random Forest · Trained on {score_metrics.get('train_size', 0):,} innings · MAE: ±{score_metrics.get('mae', 0)} runs")
+
+        st.subheader("First 10 Overs Situation")
+        sp_c1, sp_c2 = st.columns(2)
+        with sp_c1:
+            sp_team  = st.selectbox("Batting Team", all_teams, key="sp_team")
+            sp_venue = st.selectbox("Venue", all_venues, key="sp_venue") if all_venues else "Unknown"
+        with sp_c2:
+            sp_runs_10 = st.slider("Runs scored in 10 overs", 0, 120, 65, key="sp_runs")
+            sp_wkts_10 = st.slider("Wickets lost in 10 overs", 0, 8, 2, key="sp_wkts")
+
+        if st.button("Predict Final Score", key="sp_btn"):
+            pred, low, high = predict_final_score(
+                score_model, score_scaler, score_enc, score_feats,
+                sp_team, sp_venue, sp_runs_10, sp_wkts_10
+            )
+
+            s1, s2, s3 = st.columns(3)
+            s1.metric("Predicted Score", pred)
+            s2.metric("Conservative", low)
+            s3.metric("Aggressive", high)
+
+            # Bar showing range
+            fig_range = go.Figure()
+            fig_range.add_trace(go.Bar(
+                x=["Conservative", "Predicted", "Aggressive"],
+                y=[low, pred, high],
+                marker_color=["#E8DDD0", "#9B6440", "#C4956A"],
+                text=[str(low), str(pred), str(high)],
+                textposition="outside",
+                textfont=dict(family="Poppins", color="#4A2E12", size=13),
+            ))
+            fig_range.update_layout(
+                yaxis=dict(range=[max(0, low - 20), high + 20]),
+                xaxis_title="Scenario",
+                yaxis_title="Projected Score",
+                showlegend=False,
+            )
+            apply_theme(fig_range, height=300)
+            st.plotly_chart(fig_range, use_container_width=True)
+
+            crr_10 = round(sp_runs_10 / 10, 2)
+            pace   = "aggressive" if crr_10 >= 8 else ("steady" if crr_10 >= 6 else "slow")
+            wkt_comment = "with wickets in hand" if sp_wkts_10 <= 2 else "but losing wickets regularly"
+            analysis = (
+                f"{sp_team} are scoring at {crr_10} runs/over after 10 overs — a {pace} start, "
+                f"{wkt_comment}. The model projects a final score between {low} and {high}, "
+                f"with {pred} as the central estimate."
+            )
+            st.markdown(f'<div class="insight-box">{analysis}</div>', unsafe_allow_html=True)
+
+        st.divider()
+        st.caption(f"Model: Random Forest (200 trees) · Mean Absolute Error: ±{score_metrics.get('mae', 0)} runs")
+
+    # ────────────────────────────────────────
+    #  ML SUB-TAB 3 — BEST XI
+    # ────────────────────────────────────────
+    with ml_tab3:
+        st.markdown('<div class="section-title">Best XI Selector</div>', unsafe_allow_html=True)
+        st.caption("Composite scoring model — Batting Index + Bowling Index = Overall Score")
+
+        bx_c1, bx_c2, bx_c3 = st.columns(3)
+        with bx_c1:
+            season_opts = ["All"] + [str(int(s)) for s in sorted(matches["season"].dropna().unique())]
+            bx_season = st.selectbox("Season", season_opts, key="bx_season")
+        with bx_c2:
+            team_opts = ["All Teams"] + all_teams
+            bx_team = st.selectbox("Team", team_opts, key="bx_team")
+        with bx_c3:
+            st.markdown("<div style='padding-top:28px'></div>", unsafe_allow_html=True)
+            bx_btn = st.button("Select Best XI", key="bx_btn")
+
+        if bx_btn:
+            bx_season_val = None if bx_season == "All" else int(bx_season)
+            bx_team_val   = None if bx_team == "All Teams" else bx_team
+
+            with st.spinner("Selecting Best XI..."):
+                xi_df = select_best_xi(
+                    deliveries_f, matches_f,
+                    season=bx_season_val,
+                    team=bx_team_val,
+                )
+
+            if xi_df.empty:
+                st.warning("Not enough data for the selected filters. Try All Seasons or All Teams.")
+            else:
+                # Role colour map
+                role_colors = {
+                    "Batter":      "#C4956A",
+                    "All-Rounder": "#9B6440",
+                    "Bowler":      "#6B3F20",
+                }
+
+                st.subheader(f"Best XI — {bx_team if bx_team != 'All Teams' else 'All Teams'} · {bx_season}")
+
+                # Styled table
+                def color_role(val):
+                    c = role_colors.get(val, "#4A2E12")
+                    return f"color: {c}; font-weight: 500"
+
+                styled = (
+                    xi_df.style
+                    .map(color_role, subset=["Role"])
+                    .format({
+                        "Batting Index":  "{:.1f}",
+                        "Bowling Index":  "{:.1f}",
+                        "Overall Score":  "{:.1f}",
+                        "Runs":           "{:.0f}",
+                        "Strike Rate":    "{:.1f}",
+                        "Wickets":        "{:.0f}",
+                        "Economy":        "{:.2f}",
+                    })
+                    .background_gradient(subset=["Overall Score"],
+                                         cmap="YlOrBr")
+                )
+                st.dataframe(styled, use_container_width=True, height=430)
+
+                # Role breakdown donut
+                role_counts = xi_df["Role"].value_counts().reset_index()
+                role_counts.columns = ["Role", "Count"]
+                fig_roles = px.pie(
+                    role_counts, names="Role", values="Count",
+                    color_discrete_map=role_colors,
+                    hole=0.5,
+                    title="Role Breakdown",
+                )
+                fig_roles.update_traces(
+                    textfont=dict(family="Poppins", color="#FAF8F4", size=12),
+                    marker=dict(line=dict(color="#FAF8F4", width=2))
+                )
+                apply_theme(fig_roles, height=300)
+                st.plotly_chart(fig_roles, use_container_width=True)
+
+                # Top scorer and top wicket taker in XI
+                top_bat  = xi_df.loc[xi_df["Batting Index"].idxmax(),  "Player"]
+                top_bowl = xi_df.loc[xi_df["Bowling Index"].idxmax(), "Player"]
+                allr_count = len(xi_df[xi_df["Role"] == "All-Rounder"])
+
+                summary = (
+                    f"The model's Best XI is led by <b>{top_bat}</b> (highest batting index) "
+                    f"and <b>{top_bowl}</b> (highest bowling index), "
+                    f"with {allr_count} all-rounder(s) providing balance."
+                )
+                st.markdown(f'<div class="insight-box">{summary}</div>', unsafe_allow_html=True)
+
+        else:
+            st.info("Select filters above and click 'Select Best XI' to generate the team.")
+
+        st.divider()
+        st.caption(
+            "Batting Index = Runs × SR + 4s×0.5 + 6s×1.0 − Dot%×0.3  ·  "
+            "Bowling Index = Wickets×20 − Economy×3 + DotBall%×0.5"
+        )
 
 
 # ══════════════════════════════════════════════
