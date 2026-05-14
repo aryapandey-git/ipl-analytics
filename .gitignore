@@ -1,0 +1,18 @@
+# Data files (too large for GitHub — add manually or use Git LFS)
+data/
+*.csv
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.env
+venv/
+.venv/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Streamlit
+.streamlit/secrets.toml
